@@ -39,6 +39,8 @@ extern "C" {
     fn CGEventGetFlags(e: Ev) -> u64;
     fn CGEventSetFlags(e: Ev, f: u64);
     fn CGEventCreateKeyboardEvent(src: Id, key: u16, down: bool) -> Ev;
+    fn CGEventCreateCopy(e: Ev) -> Ev;
+    fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
     fn CGEventKeyboardSetUnicodeString(e: Ev, n: usize, s: *const u16);
     fn CGRequestPostEventAccess() -> bool;
     fn CGRequestListenEventAccess() -> bool;
@@ -80,10 +82,12 @@ type TapCb = extern "C" fn(Id, u32, Ev, *mut c_void) -> Ev;
 
 const UTF8: u32 = 0x0800_0100;
 const KEY_DOWN: u32 = 10;
+const KEY_UP: u32 = 11;
 const TAP_DISABLED_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_USER: u32 = 0xFFFF_FFFF;
 const F_KEYCODE: u32 = 9;
 const F_AUTOREPEAT: u32 = 8;
+const F_TARGET_PID: u32 = 40;
 const SHIFT: u64 = 0x20000;
 const CAPS: u64 = 0x10000;
 const CMD_CTRL_ALT: u64 = 0x100000 | 0x40000 | 0x80000;
@@ -162,6 +166,19 @@ struct Undo {
     from: usize,
 }
 
+/// A fix waiting for the word's keys to be released: a key retyped while it is still physically held
+/// is dropped by apps ("ns" + quick space gave "т" instead of "ты").
+struct Pending {
+    erase: usize,
+    keys: Vec<Key>,
+    text: String,
+    to: usize,
+    boundary: Ev,         // copy of the swallowed space / Return key-down, posted after the fix
+    boundary_up: Ev,      // its key-up if it came while waiting (null otherwise)
+    undo: Option<Undo>,
+    since: Instant,
+}
+
 struct State {
     layouts: Vec<Layout>,
     sources: Vec<Id>, // TISInputSourceRef per layout; the list holding them is never freed
@@ -173,6 +190,10 @@ struct State {
     undo: Option<Undo>,
     ignored: HashMap<String, Instant>, // words the user just reverted: left alone for a while
     tap: Id,
+    pid: i64, // app that received the previous key
+    last_key: Instant,
+    debug: bool, // ~/Library/Logs/layoutfix.debug exists: log event classes, counts and timings (never characters)
+    pending: Option<Pending>,
 }
 
 fn load_layouts() -> (Vec<Layout>, Vec<Id>) {
@@ -268,6 +289,29 @@ fn replace(st: &State, proxy: Id, erase: usize, keys: &[Key], text: &str, to: us
     }
 }
 
+/// Physical key state from the HID system: authoritative even if a key-up was delivered elsewhere.
+fn held(key: u16) -> bool {
+    unsafe { CGEventSourceKeyState(1, key) }
+}
+
+/// Type a waiting fix now, then the space / Return it held back.
+fn flush(st: &mut State, proxy: Id) {
+    let Some(p) = st.pending.take() else { return };
+    if st.debug {
+        eprintln!("  flush after {}ms", p.since.elapsed().as_millis());
+    }
+    replace(st, proxy, p.erase, &p.keys, &p.text, p.to);
+    unsafe {
+        CGEventTapPostEvent(proxy, p.boundary);
+        CFRelease(p.boundary);
+        if !p.boundary_up.is_null() {
+            CGEventTapPostEvent(proxy, p.boundary_up);
+            CFRelease(p.boundary_up);
+        }
+    }
+    st.undo = p.undo.map(|u| Undo { at: Instant::now(), ..u });
+}
+
 /// Drop the word in progress. `dirty`: the caret may now sit inside a word, so skip until the next space.
 fn reset(st: &mut State, dirty: bool) {
     st.keys.clear();
@@ -281,13 +325,52 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
         unsafe { CGEventTapEnable(st.tap, true) };
         return e;
     }
+    if ty == KEY_UP {
+        let key = unsafe { CGEventGetIntegerValueField(e, F_KEYCODE) } as u16;
+        let Some(p) = &mut st.pending else { return e };
+        if p.boundary_up.is_null() && unsafe { CGEventGetIntegerValueField(p.boundary, F_KEYCODE) } as u16 == key {
+            p.boundary_up = unsafe { CGEventCreateCopy(e) }; // keep the space's key-up after its key-down
+            return std::ptr::null_mut();
+        }
+        if p.keys.iter().any(|k| k.0 != key && held(k.0)) && p.since.elapsed() < Duration::from_millis(400) {
+            return e;
+        }
+        // last word key released: let this key-up through first, then the fix
+        unsafe {
+            let up = CGEventCreateCopy(e);
+            CGEventTapPostEvent(proxy, up);
+            CFRelease(up);
+        }
+        flush(st, proxy);
+        return std::ptr::null_mut();
+    }
+    // Anything else while a fix waits (next key, click, a key held too long): type the fix first.
+    flush(st, proxy);
     let undo = st.undo.take();
     if ty != KEY_DOWN {
         reset(st, false); // mouse click: usually a new place to type; we only ever erase what we saw typed
+        if st.debug {
+            eprintln!("mouse");
+        }
         return e;
     }
     let key = unsafe { CGEventGetIntegerValueField(e, F_KEYCODE) } as u16;
     let flags = unsafe { CGEventGetFlags(e) };
+    // Keys buffered for another app (focus moved without a click or ⌘Tab) or long ago are not this word.
+    let pid = unsafe { CGEventGetIntegerValueField(e, F_TARGET_PID) };
+    if pid != st.pid || st.last_key.elapsed() > Duration::from_secs(5) {
+        reset(st, false);
+    }
+    if st.debug {
+        let class = match key { K_SPACE => "space", K_RETURN | K_ENTER => "return", K_BACKSPACE => "bs", _ => "key" };
+        eprintln!(
+            "{class} dt={}ms buf={} mods={} repeat={} newapp={}",
+            st.last_key.elapsed().as_millis(), st.keys.len(), flags & CMD_CTRL_ALT != 0,
+            unsafe { CGEventGetIntegerValueField(e, F_AUTOREPEAT) }, pid != st.pid
+        );
+    }
+    st.pid = pid;
+    st.last_key = Instant::now();
     if flags & CMD_CTRL_ALT != 0 {
         reset(st, false); // shortcuts, ⌘Tab: next word starts fresh
         return e;
@@ -301,6 +384,9 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
     if key == K_BACKSPACE {
         // Only a reflex ⌫ right after a fix reverts it; a later ⌫ is ordinary editing.
         if let Some(u) = undo.filter(|u| u.at.elapsed() < Duration::from_millis(700)) {
+            if st.debug {
+                eprintln!("  undo erase={}", u.keys.len() + 1);
+            }
             st.ignored.insert(u.word.to_lowercase(), Instant::now());
             replace(st, proxy, u.keys.len() + 1, &u.keys, &u.original, u.from);
             post_key(proxy, K_SPACE, ' ', false);
@@ -342,16 +428,30 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
                 Some((pk, orig, t)) => ([pk, vec![(K_SPACE, false)], keys].concat(), format!("{orig} {typed}"), format!("{t} {text}")),
                 None => (keys, typed.clone(), text),
             };
-            replace(st, proxy, keys.len(), &keys, &text, to);
-            if key == K_SPACE {
-                st.undo = Some(Undo { at: Instant::now(), keys, original, word: typed, from: cur });
+            if st.debug {
+                eprintln!("  fix erase={} type={} {}→{}", keys.len(), text.chars().count(), st.layouts[cur].lang, st.layouts[to].lang);
             }
             if st.layouts[to].cyrillic {
                 st.last_cyrillic = Some(to);
             }
+            let undo = (key == K_SPACE).then(|| Undo { at: Instant::now(), keys: keys.clone(), original, word: typed, from: cur });
+            if keys.iter().any(|k| held(k.0)) {
+                st.pending = Some(Pending {
+                    erase: keys.len(), keys, text, to,
+                    boundary: unsafe { CGEventCreateCopy(e) },
+                    boundary_up: std::ptr::null_mut(),
+                    undo, since: Instant::now(),
+                });
+                return std::ptr::null_mut();
+            }
+            replace(st, proxy, keys.len(), &keys, &text, to);
+            st.undo = undo;
             // Posted events enter the stream before the event returned here, so the user's own
             // space / Return / ⇧Return follows the fix untouched.
             return e;
+        }
+        if st.debug {
+            eprintln!("  nofix len={} cur={}", keys.len(), st.layouts[cur].lang);
         }
         if keys.len() == 1 && key == K_SPACE {
             st.prev = Some((keys, cur));
@@ -409,12 +509,16 @@ fn main() {
         undo: None,
         ignored: HashMap::new(),
         tap: null(),
+        pid: 0,
+        last_key: Instant::now(),
+        debug: std::env::var("HOME").is_ok_and(|h| std::path::Path::new(&h).join("Library/Logs/layoutfix.debug").exists()),
+        pending: None,
     }));
     unsafe {
         CGRequestListenEventAccess();
         CGRequestPostEventAccess();
         eprintln!("layoutfix: input monitoring={} post events={}", CGPreflightListenEventAccess(), CGPreflightPostEventAccess());
-        let mask = 1u64 << KEY_DOWN | 1 << 1 | 1 << 3 | 1 << 25; // key down, mouse down (left/right/other)
+        let mask = 1u64 << KEY_DOWN | 1 << KEY_UP | 1 << 1 | 1 << 3 | 1 << 25; // keys, mouse down (left/right/other)
         let tap = CGEventTapCreate(1, 0, 0, mask, on_event, st as *mut c_void);
         if tap.is_null() {
             // macOS caches the permission per process: exit so launchd restarts us with a fresh check

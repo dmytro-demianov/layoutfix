@@ -1,11 +1,10 @@
-// Minimal raw-mode line editor like Claude Code's input (Node, stdin raw): handles chars, ⌫ and Enter → file
-const fs = require('fs'); const out = process.argv[2]; let line = '';
+// Raw-mode sink like a TUI prompt (Claude Code): logs every stdin chunk as JSON, one per line.
+// `node rawline.js out.txt [kittyFlags]` — with flags, enables the kitty keyboard protocol (CSI > flags u).
+const fs = require('fs'); const out = process.argv[2]; const flags = process.argv[3];
 process.stdin.setRawMode(true); process.stdin.setEncoding('utf8');
+if (flags) process.stdout.write(`\x1b[>${flags}u`);
+if (process.argv[4]) process.stdout.write('\x1b[?2004h\x1b[?1004h\x1b[>4;2m'); // + bracketed paste, focus events, modifyOtherKeys 2 (as Claude Code)
 process.stdin.on('data', chunk => {
-  for (const ch of chunk) {
-    if (ch === '\r') { fs.appendFileSync(out, line + '\n'); line = ''; process.stdout.write('\r\n'); }
-    else if (ch === '\x7f') { line = [...line].slice(0, -1).join(''); process.stdout.write('\b \b'); }
-    else if (ch === '\x03') process.exit();
-    else { line += ch; process.stdout.write(ch); }
-  }
+  fs.appendFileSync(out, JSON.stringify(chunk).replace(/\x7f/g, '<BS>') + '\n');
+  if (chunk.includes('\x03') || chunk.includes('[99;5u')) { if (flags) process.stdout.write('\x1b[<u'); process.exit(); }
 });

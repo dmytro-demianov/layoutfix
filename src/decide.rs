@@ -17,30 +17,37 @@ pub fn translate(keys: &[Key], l: &Layout) -> Option<String> {
         .collect::<Option<String>>()
 }
 
-/// All letters, all from the layout's script.
+/// Letters of the layout's script; a hyphen or apostrophe is allowed between letters ("как-то", "don't").
 pub fn word_ok(text: &str, cyrillic: bool) -> bool {
-    !text.is_empty()
-        && text.chars().all(|c| {
-            if cyrillic {
-                ('\u{400}'..='\u{4FF}').contains(&c) && c.is_alphabetic()
-            } else {
-                c.is_ascii_alphabetic()
-            }
+    let letter = |c: char| {
+        if cyrillic { ('\u{400}'..='\u{4FF}').contains(&c) && c.is_alphabetic() } else { c.is_ascii_alphabetic() }
+    };
+    let t: Vec<char> = text.chars().collect();
+    !t.is_empty()
+        && t.iter().enumerate().all(|(i, &c)| {
+            letter(c) || (matches!(c, '-' | '\'' | '’') && i > 0 && i + 1 < t.len() && letter(t[i - 1]) && letter(t[i + 1]))
         })
 }
 
 // Words under 3 keys are too ambiguous for the spell checker ("z"/"я", "db"/"ви"): 2-letter words are fixed only
-// into this list, 1-letter ones only together with the next word (see main.rs).
+// into this list, 1-letter ones only into this list and only together with the next word (see main.rs).
 pub const MIN_LEN: usize = 3;
 const SHORT: &[(&str, &[&str])] = &[
-    ("ru", &["ты", "мы", "вы", "он", "да", "не", "на", "по", "за", "из", "от", "до", "же", "ли", "бы", "во", "со", "ну", "но", "то", "их", "об", "уж", "ей"]),
-    ("uk", &["ти", "ми", "ви", "та", "це", "як", "чи", "ще", "не", "на", "по", "за", "із", "до", "же", "би", "то", "ні", "ну", "бо", "аж"]),
-    ("en", &["is", "it", "in", "on", "at", "to", "of", "or", "if", "me", "my", "we", "he", "be", "do", "go", "no", "so", "up", "us", "an", "as", "by", "am", "hi", "ok", "oh"]),
+    ("ru", &["ты", "мы", "вы", "он", "да", "не", "на", "по", "за", "из", "от", "до", "же", "ли", "бы", "во", "со", "ну", "но", "то", "их", "об", "уж", "ей", "ща",
+            "я", "в", "с", "к", "и", "а", "о", "у"]),
+    ("uk", &["ти", "ми", "ви", "та", "це", "як", "чи", "ще", "не", "на", "по", "за", "із", "до", "же", "би", "то", "ні", "ну", "бо", "аж",
+            "я", "в", "з", "і", "й", "а", "у", "о"]),
+    ("en", &["is", "it", "in", "on", "at", "to", "of", "or", "if", "me", "my", "we", "he", "be", "do", "go", "no", "so", "up", "us", "an", "as", "by", "am", "hi", "ok", "oh",
+            "a", "i"]),
 ];
-// shortcut: typed tech abbreviations that would read as a short word in the other layout ("vs" → "мы"); extend when one bites
-const KEEP: &[&str] = &["db", "js", "ts", "ui", "ux", "ci", "cd", "pr", "ps", "vs", "os", "id", "ip", "qa", "vm", "ls", "rm", "mv", "py"];
+// shortcut: tech tokens typed in the Latin layout that read as a word in a Cyrillic one ("vs" → "мы", "ctx" → "сеч").
+// The 3-letter ones are what a run of ~480 common dev tokens through the real spell checker turned up; extend when one bites.
+const KEEP: &[&str] = &[
+    "db", "js", "ts", "ui", "ux", "ci", "cd", "pr", "ps", "vs", "os", "id", "ip", "qa", "vm", "ls", "rm", "mv", "py",
+    "ctx", "csv", "len", "vec", "rfc", "jwt", "tls", "buf", "otp", "cwe", "lfi", "rfi", "ide", "csr",
+];
 
-fn short_word(t: &str, lang: &str) -> bool {
+pub fn short_word(t: &str, lang: &str) -> bool {
     let t = t.to_lowercase();
     SHORT.iter().any(|(l, w)| *l == lang && w.contains(&t.as_str()))
 }
@@ -61,9 +68,16 @@ pub fn decide(
     let core = &keys[head..keys.len() - tail];
     let prefix: String = typed_all[..head].iter().collect();
     let suffix: String = typed_all[typed_all.len() - tail..].iter().collect();
+    // ALL-CAPS short tokens are usually acronyms (API, SQL, KB)
+    if (2..=4).contains(&keys.len()) && keys.iter().all(|k| k.1) {
+        return None;
+    }
+    let typed = translate(core, c)?;
+    if !c.cyrillic && KEEP.contains(&typed.to_lowercase().as_str()) {
+        return None;
+    }
     if core.len() == 2 && head + tail == 0 {
-        let typed = translate(core, c)?;
-        if short_word(&typed, &c.lang) || KEEP.contains(&typed.to_lowercase().as_str()) || valid(&typed, &c.lang) {
+        if short_word(&typed, &c.lang) || valid(&typed, &c.lang) {
             return None;
         }
         let mut found: Vec<(usize, String)> = layouts.iter().enumerate()
@@ -78,12 +92,14 @@ pub fn decide(
     if keys.len() < MIN_LEN {
         return None;
     }
-    // ALL-CAPS short tokens are usually acronyms (API, SQL)
-    if keys.len() <= 4 && keys.iter().all(|k| k.1) {
-        return None;
-    }
-    let typed = translate(core, c)?;
-    if !core.is_empty() && word_ok(&typed, c.cyrillic) && valid(&typed, &c.lang) {
+    // Already a word where it was typed. A 1–2 letter core next to punctuation ("'nj" = "это") counts only
+    // if it is a common short word: the spell checker accepts almost any two letters.
+    let core_valid = if core.len() < MIN_LEN {
+        short_word(&typed, &c.lang)
+    } else {
+        word_ok(&typed, c.cyrillic) && valid(&typed, &c.lang)
+    };
+    if core_valid {
         return None;
     }
     let mut find = |core: &[Key], prefix: &str, suffix: &str, strict: bool| {
@@ -217,6 +233,24 @@ mod tests {
         assert_eq!(decide(&k(4, 5), &ls, 0, None, &mut none), None); // vs is kept
         let mut en_ns = dict(&["ns"]);
         assert_eq!(decide(&k(0, 1), &ls, 0, None, &mut en_ns), None); // valid where typed
+    }
+
+    #[test]
+    fn inner_hyphen_and_apostrophe() {
+        assert!(word_ok("как-то", true));
+        assert!(word_ok("don't", false));
+        assert!(!word_ok("-rf", false));
+        assert!(!word_ok("it'", false));
+    }
+
+    #[test]
+    fn caps_acronyms_and_kept_tokens_left_alone() {
+        let ls = vec![layout("en", false, "kbctx"), layout("ru", true, "лисеч")];
+        let mut any = |_: &str, l: &str| l == "ru";
+        let caps: Vec<Key> = vec![(0, true), (1, true)];
+        assert_eq!(decide(&caps, &ls, 0, None, &mut any), None); // KB
+        let ctx: Vec<Key> = vec![(2, false), (3, false), (4, false)];
+        assert_eq!(decide(&ctx, &ls, 0, None, &mut any), None); // ctx is kept though "сеч" is a word
     }
 
     #[test]

@@ -10,9 +10,10 @@ How it works: event tap → keycodes of the current word → on space, read the 
 
 - RU vs UA: whichever dictionary has the word; if both, the last Cyrillic layout you used.
 - ⌫ within 0.7 s of a fix reverts it; that word is then left alone for 10 minutes. A later ⌫ is ordinary editing.
-- 2-letter words are fixed only into a list of common ones (`ns` → `ты`, `ше` → `it`); tech abbreviations like `db`, `vs`, `ls` are kept. A 1-letter word is fixed together with the next word (`z levf.` → `я думаю`).
-- Fixed on space and on Enter (Enter is held until the fix is typed). Trailing punctuation stays as typed: `ghbdtn,` → `привет,`, `руддщб` → `hello,`.
-- Not fixed: words with digits, password fields (macOS Secure Input hides keys from every app, also in Ghostty when a prompt hides input).
+- 2-letter words are fixed only into a list of common ones (`ns` → `ты`, `ше` → `it`). A 1-letter word is fixed together with the next word (`z levf.` → `я думаю`), unless it already is a word (`a`, `I`).
+- Left alone: tech tokens that happen to read as a Cyrillic word (`db`, `vs`, `ls`, `ctx`, `len`, `csv`… — `KEEP` in `src/decide.rs`), ALL-CAPS tokens up to 4 letters (`API`, `KB`).
+- Fixed on space and on Enter; your own space / Enter / ⇧Enter follows the fix untouched. A key that is a letter in the target layout is read as that letter (`levf.` → `думаю`, `'nj` → `это`); otherwise punctuation stays as typed (`ghbdtn,` → `привет,`, `"цщгдв"` → `"would"`). Hyphens and apostrophes inside a word work (`rfr-nj` → `как-то`, `вщтэе` → `don't`).
+- Not fixed: words with digits, a word in which a key was held until it auto-repeated, password fields (macOS Secure Input hides keys from every app, also in Ghostty when a prompt hides input).
 - Typed text is never written to disk, logged or sent anywhere. No third-party dependencies.
 
 Status log (permissions only): `~/Library/Logs/layoutfix.log`.
@@ -21,4 +22,4 @@ Checks:
 - `cargo test` — decision logic.
 - `target/release/layoutfix --dump ghbdtn` — how those keys read in each layout and what would be fixed.
 - `tests/human.py [seeds]` — human-like rhythm (bursts, pauses mid-word, key rollover) on mixed-language phrases.
-- `tests/e2e.py [delay]` — types 39 real cases into a separate Ghostty window and compares (build `tests/bin` first: `swiftc -O tests/typer.swift -o tests/bin/typer && swiftc -O tests/layout.swift -o tests/bin/layout`).
+- `tests/e2e.py [delay]` — types 46 real cases into a separate Ghostty window and compares (build `tests/bin` first: `swiftc -O tests/typer.swift -o tests/bin/typer && swiftc -O tests/layout.swift -o tests/bin/layout`).

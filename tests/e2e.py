@@ -50,6 +50,13 @@ CASES = [
     ("en", "lf yt pyf.", "да не знаю"),
     ("ru", "is it ok", "is it ok"),
     ("en", "git db vs ls", "git db vs ls"),
+    ("en", "rfr-nj nfv", "как-то там"),
+    ("en", "'nj [jhjij", "это хорошо"),  # ' key is э, [ is х
+    ("en", "a ghbdtn", "a привет"),  # "a" is a word: stays
+    ("en", "KB DJ OK", "KB DJ OK"),
+    ("en", "ctx len buf csv", "ctx len buf csv"),
+    ("ru", "don't worry", "don't worry"),
+    ("ru", "I think", "I think"),
     ("en", "kj,", "лоб"),  # , key is б
     ("en", "ckjdj.", "слово."),
     ("en", '"ghbdtn"', '"привет"'),

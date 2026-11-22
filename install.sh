@@ -38,4 +38,4 @@ cat > "$AGENT" <<PLIST
 </dict></plist>
 PLIST
 launchctl bootstrap "gui/$(id -u)" "$AGENT"
-echo "Installed. Grant Accessibility to LayoutFix: System Settings → Privacy & Security → Accessibility."
+echo "Installed. First time only: allow LayoutFix in System Settings → Privacy & Security → Accessibility and Input Monitoring; status is in ~/Library/Logs/layoutfix.log."

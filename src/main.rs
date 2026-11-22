@@ -83,6 +83,7 @@ const KEY_DOWN: u32 = 10;
 const TAP_DISABLED_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_USER: u32 = 0xFFFF_FFFF;
 const F_KEYCODE: u32 = 9;
+const F_AUTOREPEAT: u32 = 8;
 const SHIFT: u64 = 0x20000;
 const CAPS: u64 = 0x10000;
 const CMD_CTRL_ALT: u64 = 0x100000 | 0x40000 | 0x80000;
@@ -155,9 +156,9 @@ impl Speller {
 
 struct Undo {
     at: Instant,
-    end: (u16, char), // boundary that was re-posted: space or return
     keys: Vec<Key>,
-    original: String,
+    original: String, // text to put back (may include a one-letter word before)
+    word: String,     // the word itself: left alone for a while after a revert
     from: usize,
 }
 
@@ -167,7 +168,7 @@ struct State {
     speller: Speller,
     keys: Vec<Key>,
     dirty: bool, // caret moved or an unknown key was pressed: skip the current word
-    prev: Option<(Vec<Key>, usize)>, // short word right before the current one, with its layout
+    prev: Option<(Vec<Key>, usize)>, // one-letter word right before the current one, with its layout
     last_cyrillic: Option<usize>,
     undo: Option<Undo>,
     ignored: HashMap<String, Instant>, // words the user just reverted: left alone for a while
@@ -249,8 +250,8 @@ fn post_key(proxy: Id, key: u16, ch: char, shift: bool) {
     }
 }
 
-/// Erase `erase` chars, switch layout, retype `text` on the same physical keys, then a space.
-fn replace(st: &State, proxy: Id, erase: usize, keys: &[Key], text: &str, to: usize, end: (u16, char)) {
+/// Erase `erase` chars, switch layout, retype `text` on the same physical keys.
+fn replace(st: &State, proxy: Id, erase: usize, keys: &[Key], text: &str, to: usize) {
     unsafe { TISSelectInputSource(st.sources[to]) };
     for _ in 0..erase {
         post_key(proxy, K_BACKSPACE, '\u{8}', false);
@@ -265,7 +266,6 @@ fn replace(st: &State, proxy: Id, erase: usize, keys: &[Key], text: &str, to: us
         };
         post_key(proxy, key, c, shift);
     }
-    post_key(proxy, end.0, end.1, false);
 }
 
 /// Drop the word in progress. `dirty`: the caret may now sit inside a word, so skip until the next space.
@@ -292,14 +292,18 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
         reset(st, false); // shortcuts, ⌘Tab: next word starts fresh
         return e;
     }
+    if unsafe { CGEventGetIntegerValueField(e, F_AUTOREPEAT) } != 0 {
+        // A held key repeats in terminals but not in apps with the accent popup: the count is unknown.
+        reset(st, true);
+        return e;
+    }
 
     if key == K_BACKSPACE {
         // Only a reflex ⌫ right after a fix reverts it; a later ⌫ is ordinary editing.
         if let Some(u) = undo.filter(|u| u.at.elapsed() < Duration::from_millis(700)) {
-            // Backspace right after a fix reverts it; that word is then left alone for the session.
-            let inserted = u.keys.len();
-            st.ignored.insert(u.original.to_lowercase(), Instant::now());
-            replace(st, proxy, inserted + 1, &u.keys, &u.original, u.from, u.end);
+            st.ignored.insert(u.word.to_lowercase(), Instant::now());
+            replace(st, proxy, u.keys.len() + 1, &u.keys, &u.original, u.from);
+            post_key(proxy, K_SPACE, ' ', false);
             reset(st, false);
             return std::ptr::null_mut();
         }
@@ -310,7 +314,6 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
     }
 
     if key == K_SPACE || key == K_RETURN || key == K_ENTER {
-        let end = if key == K_SPACE { (K_SPACE, ' ') } else { (key, '\r') };
         let keys = std::mem::take(&mut st.keys);
         let dirty = std::mem::replace(&mut st.dirty, false);
         let Some(cur) = current_layout(st) else { return e };
@@ -328,27 +331,29 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
         }
         let (layouts, last, speller) = (&st.layouts, st.last_cyrillic, &mut st.speller);
         if let Some((to, text)) = decide(&keys, layouts, cur, last, &mut |w, l| speller.valid(w, l)) {
-            // A short word just before ("ьн problems") is too ambiguous alone; fix it too if it fits the same layout.
-            let short = prev.filter(|(_, l)| *l == cur).and_then(|(pk, _)| {
+            // A one-letter word just before ("z levf." = "я думаю") is fixed along, unless it already is a word ("a", "I").
+            let one = prev.filter(|(_, l)| *l == cur).and_then(|(pk, _)| {
+                let orig = decide::translate(&pk, &st.layouts[cur])?;
                 let t = decide::translate(&pk, &st.layouts[to])?;
-                let ok = decide::word_ok(&t, st.layouts[to].cyrillic) && speller.valid(&t, &st.layouts[to].lang);
-                ok.then(|| (pk, t))
+                let ok = !decide::short_word(&orig, &st.layouts[cur].lang) && decide::short_word(&t, &st.layouts[to].lang);
+                ok.then_some((pk, orig, t))
             });
-            let (keys, typed, text) = match short {
-                Some((pk, t)) => {
-                    let orig = decide::translate(&pk, &st.layouts[cur]).unwrap_or_default();
-                    ([pk, vec![(K_SPACE, false)], keys].concat(), format!("{orig} {typed}"), format!("{t} {text}"))
-                }
-                None => (keys, typed, text),
+            let (keys, original, text) = match one {
+                Some((pk, orig, t)) => ([pk, vec![(K_SPACE, false)], keys].concat(), format!("{orig} {typed}"), format!("{t} {text}")),
+                None => (keys, typed.clone(), text),
             };
-            replace(st, proxy, keys.len(), &keys, &text, to, end);
-            st.undo = Some(Undo { at: Instant::now(), end, keys, original: typed, from: cur });
+            replace(st, proxy, keys.len(), &keys, &text, to);
+            if key == K_SPACE {
+                st.undo = Some(Undo { at: Instant::now(), keys, original, word: typed, from: cur });
+            }
             if st.layouts[to].cyrillic {
                 st.last_cyrillic = Some(to);
             }
-            return std::ptr::null_mut(); // the space is re-posted after the fix
+            // Posted events enter the stream before the event returned here, so the user's own
+            // space / Return / ⇧Return follows the fix untouched.
+            return e;
         }
-        if keys.len() < decide::MIN_LEN && key == K_SPACE {
+        if keys.len() == 1 && key == K_SPACE {
             st.prev = Some((keys, cur));
         }
         return e;
@@ -356,8 +361,12 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
 
     // A key that types a character continues the word (punctuation is sorted out by decide);
     // keys that type nothing (arrows, Home, F-keys) leave the caret somewhere unknown.
-    let shift = flags & (SHIFT | CAPS) != 0;
     let prints = key < 128 && st.layouts.iter().any(|l| l.table[key as usize * 2].is_some());
+    // Caps Lock upper-cases letters only; a key that is punctuation in some layout stays unshifted
+    let caps = flags & CAPS != 0
+        && prints
+        && st.layouts.iter().all(|l| l.table[key as usize * 2].is_some_and(char::is_alphabetic));
+    let shift = flags & SHIFT != 0 || caps;
     if prints && st.keys.len() < 64 {
         st.keys.push((key, shift));
     } else {
@@ -406,14 +415,13 @@ fn main() {
         CGRequestPostEventAccess();
         eprintln!("layoutfix: input monitoring={} post events={}", CGPreflightListenEventAccess(), CGPreflightPostEventAccess());
         let mask = 1u64 << KEY_DOWN | 1 << 1 | 1 << 3 | 1 << 25; // key down, mouse down (left/right/other)
-        let tap = loop {
-            let t = CGEventTapCreate(1, 0, 0, mask, on_event, st as *mut c_void);
-            if !t.is_null() {
-                break t;
-            }
-            eprintln!("layoutfix: waiting for Accessibility permission");
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        };
+        let tap = CGEventTapCreate(1, 0, 0, mask, on_event, st as *mut c_void);
+        if tap.is_null() {
+            // macOS caches the permission per process: exit so launchd restarts us with a fresh check
+            eprintln!("layoutfix: no Accessibility permission yet (System Settings → Privacy & Security)");
+            std::thread::sleep(Duration::from_secs(5));
+            std::process::exit(1);
+        }
         (*st).tap = tap;
         CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(null(), tap, 0), kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);

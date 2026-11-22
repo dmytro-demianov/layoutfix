@@ -16,6 +16,7 @@ PHRASES = [
     ("ru", "how are you doing ghbdtn my problems ckjdj",
      "how are you doing привет my problems слово"),
     ("en", "ghbdtn rfr ltkf ye;yj gjvjxm", "привет как дела нужно помочь"),
+    ("en", "z levf. xnj dct hf,jnftn", "я думаю что все работает"),
 ]
 
 

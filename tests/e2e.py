@@ -45,6 +45,15 @@ CASES = [
     ("en", "ghbdtn world", "привет world"),
     ("en", "ghbdtn\n", "привет"),  # fixed before Enter
     ("en", "ghbdsn, zr cghfdb", "привіт, як справи"),
+    ("en", "levf.", "думаю"),  # . key is ю
+    ("en", "what ns ns ns ns", "what ты ты ты ты"),
+    ("en", "lf yt pyf.", "да не знаю"),
+    ("ru", "is it ok", "is it ok"),
+    ("en", "git db vs ls", "git db vs ls"),
+    ("en", "kj,", "лоб"),  # , key is б
+    ("en", "ckjdj.", "слово."),
+    ("en", '"ghbdtn"', '"привет"'),
+    ("en", "(ghbdtn)", "(привет)"),
     ("en", '"ghbdtn"', '"привет"'),
     ("en", "(ghbdtn)", "(привет)"),
     # typed in Cyrillic layout, meant English

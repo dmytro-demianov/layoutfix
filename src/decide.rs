@@ -29,8 +29,21 @@ pub fn word_ok(text: &str, cyrillic: bool) -> bool {
         })
 }
 
-// shortcut: words under 3 keys are skipped (too ambiguous: "z"/"я", "ye"/"ну"); add a common-short-words list if needed
+// Words under 3 keys are too ambiguous for the spell checker ("z"/"я", "db"/"ви"): 2-letter words are fixed only
+// into this list, 1-letter ones only together with the next word (see main.rs).
 pub const MIN_LEN: usize = 3;
+const SHORT: &[(&str, &[&str])] = &[
+    ("ru", &["ты", "мы", "вы", "он", "да", "не", "на", "по", "за", "из", "от", "до", "же", "ли", "бы", "во", "со", "ну", "но", "то", "их", "об", "уж", "ей"]),
+    ("uk", &["ти", "ми", "ви", "та", "це", "як", "чи", "ще", "не", "на", "по", "за", "із", "до", "же", "би", "то", "ні", "ну", "бо", "аж"]),
+    ("en", &["is", "it", "in", "on", "at", "to", "of", "or", "if", "me", "my", "we", "he", "be", "do", "go", "no", "so", "up", "us", "an", "as", "by", "am", "hi", "ok", "oh"]),
+];
+// shortcut: typed tech abbreviations that would read as a short word in the other layout ("vs" → "мы"); extend when one bites
+const KEEP: &[&str] = &["db", "js", "ts", "ui", "ux", "ci", "cd", "pr", "ps", "vs", "os", "id", "ip", "qa", "vm", "ls", "rm", "mv", "py"];
+
+fn short_word(t: &str, lang: &str) -> bool {
+    let t = t.to_lowercase();
+    SHORT.iter().any(|(l, w)| *l == lang && w.contains(&t.as_str()))
+}
 
 /// Returns (target layout index, corrected text) or None to leave the word alone.
 pub fn decide(
@@ -48,29 +61,52 @@ pub fn decide(
     let core = &keys[head..keys.len() - tail];
     let prefix: String = typed_all[..head].iter().collect();
     let suffix: String = typed_all[typed_all.len() - tail..].iter().collect();
-    if core.len() < MIN_LEN {
+    if core.len() == 2 && head + tail == 0 {
+        let typed = translate(core, c)?;
+        if short_word(&typed, &c.lang) || KEEP.contains(&typed.to_lowercase().as_str()) || valid(&typed, &c.lang) {
+            return None;
+        }
+        let mut found: Vec<(usize, String)> = layouts.iter().enumerate()
+            .filter(|(_, l)| l.cyrillic != c.cyrillic)
+            .filter_map(|(i, l)| translate(core, l).filter(|t| short_word(t, &l.lang)).map(|t| (i, t)))
+            .collect();
+        if let Some(hit) = last_cyrillic.and_then(|p| found.iter().position(|(i, _)| *i == p)) {
+            return Some(found.swap_remove(hit));
+        }
+        return found.into_iter().next();
+    }
+    if keys.len() < MIN_LEN {
         return None;
     }
     // ALL-CAPS short tokens are usually acronyms (API, SQL)
-    if core.len() <= 4 && core.iter().all(|k| k.1) {
+    if keys.len() <= 4 && keys.iter().all(|k| k.1) {
         return None;
     }
     let typed = translate(core, c)?;
-    if word_ok(&typed, c.cyrillic) && valid(&typed, &c.lang) {
+    if !core.is_empty() && word_ok(&typed, c.cyrillic) && valid(&typed, &c.lang) {
         return None;
     }
-    let mut found: Vec<(usize, String)> = Vec::new();
-    for (i, l) in layouts.iter().enumerate() {
-        if l.cyrillic == c.cyrillic {
-            continue;
-        }
-        if let Some(t) = translate(core, l) {
-            // keys that are letters here but punctuation in the target ("руддщб" → "hello,")
-            let w = t.trim_matches(|ch: char| !ch.is_alphabetic());
-            if w.chars().count() >= MIN_LEN && word_ok(w, l.cyrillic) && valid(w, &l.lang) {
-                found.push((i, format!("{prefix}{t}{suffix}")));
+    let mut find = |core: &[Key], prefix: &str, suffix: &str, strict: bool| {
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for (i, l) in layouts.iter().enumerate() {
+            if l.cyrillic == c.cyrillic {
+                continue;
+            }
+            if let Some(t) = translate(core, l) {
+                // keys that are letters here but punctuation in the target ("руддщб" → "hello,")
+                let w = if strict { t.as_str() } else { t.trim_matches(|ch: char| !ch.is_alphabetic()) };
+                if w.chars().count() >= MIN_LEN && word_ok(w, l.cyrillic) && valid(w, &l.lang) {
+                    found.push((i, format!("{prefix}{t}{suffix}")));
+                }
             }
         }
+        found
+    };
+    // First every key as a letter of the target: "levf." is "думаю" (the . key is ю), not "дума" + ".".
+    // Then punctuation kept as typed: "ghbdtn," → "привет,", "\"цщгдв\"" → "\"would\"", "руддщб" → "hello,".
+    let mut found = find(keys, "", "", true);
+    if found.is_empty() && core.len() >= MIN_LEN {
+        found = find(core, &prefix, &suffix, false);
     }
     if let Some(p) = last_cyrillic {
         if let Some(hit) = found.iter().position(|(i, _)| *i == p) {
@@ -161,6 +197,26 @@ mod tests {
     fn trailing_letter_that_is_punct_in_target() {
         let mut v = dict(&["ghbdtn"]);
         assert_eq!(decide(&KP, &setup_punct(), 1, None, &mut v), Some((0, "ghbdtn,".into())));
+    }
+
+    #[test]
+    fn punct_key_that_is_a_letter_wins_when_whole_word_valid() {
+        // en "ghbdtn," → ru "приветб": if "приветб" were a word it must win over "привет,"
+        let mut v = dict(&["приветб", "привет"]);
+        assert_eq!(decide(&KP, &setup_punct(), 0, None, &mut v), Some((1, "приветб".into())));
+    }
+
+    #[test]
+    fn two_letter_words_only_from_the_list() {
+        let mut ls = vec![layout("en", false, "nsdbvs"), layout("ru", true, "тывимы")];
+        ls[1].lang = "ru".into();
+        let k = |a: u16, b: u16| vec![(a, false), (b, false)];
+        let mut none = dict(&[]);
+        assert_eq!(decide(&k(0, 1), &ls, 0, None, &mut none), Some((1, "ты".into()))); // ns → ты
+        assert_eq!(decide(&k(2, 3), &ls, 0, None, &mut none), None); // db → "ви" is not ru list
+        assert_eq!(decide(&k(4, 5), &ls, 0, None, &mut none), None); // vs is kept
+        let mut en_ns = dict(&["ns"]);
+        assert_eq!(decide(&k(0, 1), &ls, 0, None, &mut en_ns), None); // valid where typed
     }
 
     #[test]

@@ -10,7 +10,7 @@ How it works: event tap → keycodes of the current word → on space, read the 
 
 - RU vs UA: whichever dictionary has the word; if both, the last Cyrillic layout you used.
 - ⌫ within 0.7 s of a fix reverts it; that word is then left alone for 10 minutes. A later ⌫ is ordinary editing.
-- A 1–2 letter word is fixed only together with the next word (`ьн зкщидуьы` → `my problems`).
+- 2-letter words are fixed only into a list of common ones (`ns` → `ты`, `ше` → `it`); tech abbreviations like `db`, `vs`, `ls` are kept. A 1-letter word is fixed together with the next word (`z levf.` → `я думаю`).
 - Fixed on space and on Enter (Enter is held until the fix is typed). Trailing punctuation stays as typed: `ghbdtn,` → `привет,`, `руддщб` → `hello,`.
 - Not fixed: words with digits, password fields (macOS Secure Input hides keys from every app, also in Ghostty when a prompt hides input).
 - Typed text is never written to disk, logged or sent anywhere. No third-party dependencies.
@@ -20,4 +20,5 @@ Status log (permissions only): `~/Library/Logs/layoutfix.log`.
 Checks:
 - `cargo test` — decision logic.
 - `target/release/layoutfix --dump ghbdtn` — how those keys read in each layout and what would be fixed.
-- `tests/e2e.py [delay]` — types 26 real cases into a separate Ghostty window and compares (build `tests/bin` first: `swiftc -O tests/typer.swift -o tests/bin/typer && swiftc -O tests/layout.swift -o tests/bin/layout`).
+- `tests/human.py [seeds]` — human-like rhythm (bursts, pauses mid-word, key rollover) on mixed-language phrases.
+- `tests/e2e.py [delay]` — types 39 real cases into a separate Ghostty window and compares (build `tests/bin` first: `swiftc -O tests/typer.swift -o tests/bin/typer && swiftc -O tests/layout.swift -o tests/bin/layout`).

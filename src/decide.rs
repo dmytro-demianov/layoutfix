@@ -132,6 +132,58 @@ pub fn decide(
     found.into_iter().next()
 }
 
+/// One edit apart (insert, delete, replace, or swap of two neighbours) or equal.
+pub fn within_one(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (s, l) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if l.len() - s.len() > 1 {
+        return false;
+    }
+    let i = s.iter().zip(l.iter()).take_while(|(x, y)| x == y).count();
+    if i == s.len() {
+        return true;
+    }
+    if s.len() < l.len() {
+        return s[i..] == l[i + 1..];
+    }
+    s[i + 1..] == l[i + 1..] || (i + 1 < s.len() && s[i] == l[i + 1] && s[i + 1] == l[i] && s[i + 2..] == l[i + 2..])
+}
+
+pub const TYPO_MIN: usize = 5;
+
+/// Wrong layout plus a typo ("ghbdtnn" → "приветт"): the typed text is nowhere near a word, while another
+/// layout reads one edit away from a word. `dict(w, lang, false)`: w is a word or one edit from one;
+/// `dict(w, lang, true)`: w is far from every word (the spell checker has nothing to suggest).
+/// shortcut: punctuation around the word ("ghbdtnn,") is not split off; extend like `decide` if missed.
+pub fn typo(
+    keys: &[Key],
+    layouts: &[Layout],
+    cur: usize,
+    last_cyrillic: Option<usize>,
+    dict: &mut dyn FnMut(&str, &str, bool) -> bool,
+) -> Option<(usize, String)> {
+    let c = &layouts[cur];
+    let typed = translate(keys, c)?;
+    // "grafana" gets suggestions (griffin) and is left alone; "ghbdtnn", "cgfcb,jj" get none
+    if keys.len() < TYPO_MIN || keys.iter().all(|k| k.1) || !dict(&typed, &c.lang, true) {
+        return None;
+    }
+    let mut found: Vec<(usize, String)> = layouts.iter().enumerate()
+        .filter(|(_, l)| l.cyrillic != c.cyrillic)
+        .filter_map(|(i, l)| translate(keys, l).filter(|t| word_ok(t, l.cyrillic) && dict(t, &l.lang, false)).map(|t| (i, t)))
+        .collect();
+    if let Some(hit) = last_cyrillic.and_then(|p| found.iter().position(|(i, _)| *i == p)) {
+        return Some(found.swap_remove(hit));
+    }
+    found.into_iter().next()
+}
+
+/// "ПРивет", "GHbdtn": Shift held a letter too long. Keys with only the first letter shifted.
+pub fn fix_case(keys: &[Key]) -> Option<Vec<Key>> {
+    let ok = keys.len() >= 5 && keys[0].1 && keys[1].1 && keys[2..].iter().all(|k| !k.1);
+    ok.then(|| keys.iter().enumerate().map(|(i, &(k, s))| (k, s && i == 0)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +321,36 @@ mod tests {
                 assert_eq!(t.chars().count(), KP.len());
             }
         }
+    }
+
+    #[test]
+    fn one_edit() {
+        assert!(within_one("привет", "приветт"));
+        assert!(within_one("привет", "прибет"));
+        assert!(within_one("привет", "пирвет"));
+        assert!(within_one("привет", "првет"));
+        assert!(!within_one("привет", "пирвте"));
+        assert!(!within_one("привет", "привееет"));
+    }
+
+    #[test]
+    fn typo_in_wrong_layout() {
+        let ls = vec![layout("en", false, "ghbdtnx"), layout("ru", true, "приветч")];
+        let keys: Vec<Key> = [0, 1, 2, 3, 4, 5, 5].iter().map(|&k| (k, false)).collect(); // ghbdtnn
+        let mut near = |w: &str, _: &str, far: bool| within_one(w, "привет") != far;
+        assert_eq!(typo(&keys, &ls, 0, None, &mut near), Some((1, "приветт".into())));
+        let mut en_near = |w: &str, _: &str, far: bool| within_one(w, "ghbdtn") != far; // typo in the right layout: left alone
+        assert_eq!(typo(&keys, &ls, 0, None, &mut en_near), None);
+        assert_eq!(typo(&keys[..4], &ls, 0, None, &mut near), None); // too short
+    }
+
+    #[test]
+    fn double_capital() {
+        let k = |s: &[bool]| s.iter().enumerate().map(|(i, &s)| (i as u16, s)).collect::<Vec<Key>>();
+        assert_eq!(fix_case(&k(&[true, true, false, false, false, false])), Some(k(&[true, false, false, false, false, false])));
+        assert_eq!(fix_case(&k(&[true, true, true, false, false])), None); // SSHed
+        assert_eq!(fix_case(&k(&[true, true, false, false])), None); // MBps
+        assert_eq!(fix_case(&k(&[true, false, false, false, false])), None);
     }
 
     #[test]

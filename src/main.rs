@@ -5,7 +5,8 @@
 mod decide;
 
 use decide::{decide, Key, Layout};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::ffi::c_void;
 use std::ptr::null;
@@ -109,11 +110,19 @@ fn rstr(s: Id) -> String {
     String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
+#[repr(C)]
+struct Range {
+    loc: usize,
+    len: usize,
+}
+
 /// macOS spell checker (local AppleSpell service), cached per word.
 struct Speller {
     checker: Id,
     sel: Id,
+    guess_sel: Id,
     cache: HashMap<(String, String), bool>,
+    guess_cache: HashMap<(String, String), Vec<String>>,
 }
 
 impl Speller {
@@ -125,7 +134,8 @@ impl Speller {
             let sel = sel_registerName(
                 b"checkSpellingOfString:startingAt:language:wrap:inSpellDocumentWithTag:wordCount:\0".as_ptr(),
             );
-            Speller { checker, sel, cache: HashMap::new() }
+            let guess_sel = sel_registerName(b"guessesForWordRange:inString:language:inSpellDocumentWithTag:\0".as_ptr());
+            Speller { checker, sel, guess_sel, cache: HashMap::new(), guess_cache: HashMap::new() }
         }
     }
 
@@ -133,11 +143,6 @@ impl Speller {
         let key = (word.to_lowercase(), lang.to_string());
         if let Some(&v) = self.cache.get(&key) {
             return v;
-        }
-        #[repr(C)]
-        struct Range {
-            loc: usize,
-            len: usize,
         }
         let ok = unsafe {
             let check: extern "C" fn(Id, Id, Id, isize, Id, bool, isize, *mut isize) -> Range =
@@ -156,14 +161,124 @@ impl Speller {
         self.cache.insert(key, ok);
         ok
     }
+
+    /// Spell checker suggestions, lowercased.
+    fn guesses(&mut self, word: &str, lang: &str) -> &[String] {
+        let key = (word.to_lowercase(), lang.to_string());
+        if !self.guess_cache.contains_key(&key) {
+            let list = unsafe {
+                let guesses: extern "C" fn(Id, Id, Range, Id, Id, isize) -> Id = std::mem::transmute(objc_msgSend as *const ());
+                let pool = objc_autoreleasePoolPush();
+                let (w, l) = (cfstr(word), cfstr(lang));
+                let arr = guesses(self.checker, self.guess_sel, Range { loc: 0, len: word.encode_utf16().count() }, w, l, 0);
+                let n = if arr.is_null() { 0 } else { CFArrayGetCount(arr) };
+                let list: Vec<String> = (0..n).map(|i| rstr(CFArrayGetValueAtIndex(arr, i)).to_lowercase()).collect();
+                CFRelease(w);
+                CFRelease(l);
+                objc_autoreleasePoolPop(pool);
+                list
+            };
+            if self.guess_cache.len() > 50_000 {
+                self.guess_cache.clear();
+            }
+            self.guess_cache.insert(key.clone(), list);
+        }
+        &self.guess_cache[&key]
+    }
+
+    /// far: not a word and nothing to suggest. Otherwise: a word, or one edit from a suggestion.
+    fn typo_check(&mut self, word: &str, lang: &str, far: bool) -> bool {
+        if self.valid(word, lang) {
+            return !far;
+        }
+        let w = word.to_lowercase();
+        let g = self.guesses(word, lang);
+        if far { g.is_empty() } else { g.iter().any(|g| decide::within_one(&w, g)) }
+    }
+}
+
+/// What the user taught us, kept across restarts: key sequences they retyped in another layout (fixed
+/// from now on) and words they reverted (never fixed). Only salted hashes are written, never the text.
+/// shortcut: salt sits in the same file, so a short word can be brute-forced by whoever reads it (0600, own account only).
+struct Memory {
+    path: PathBuf,
+    salt: u64,
+    learned: HashMap<u64, String>, // keys hash → layout id
+    ignored: HashSet<u64>,         // typed word hash
+}
+
+impl Memory {
+    fn load() -> Self {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = PathBuf::from(home).join("Library/Application Support/LayoutFix/memory");
+        let mut m = Memory { path, salt: 0, learned: HashMap::new(), ignored: HashSet::new() };
+        for line in std::fs::read_to_string(&m.path).unwrap_or_default().lines() {
+            let p: Vec<&str> = line.splitn(3, ' ').collect();
+            let h = p.get(1).and_then(|h| u64::from_str_radix(h, 16).ok()).unwrap_or(0);
+            match (p[0], p.get(2)) {
+                ("salt", _) => m.salt = h,
+                ("learn", Some(id)) => drop(m.learned.insert(h, id.to_string())),
+                ("ignore", _) => drop(m.ignored.insert(h)),
+                _ => {}
+            }
+        }
+        if m.salt == 0 {
+            let mut b = [0u8; 8];
+            use std::io::Read;
+            let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+            m.salt = u64::from_le_bytes(b) | 1;
+        }
+        m
+    }
+
+    fn save(&self) {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let mut s = format!("salt {:x}\n", self.salt);
+        self.learned.iter().for_each(|(h, id)| s += &format!("learn {h:x} {id}\n"));
+        self.ignored.iter().for_each(|h| s += &format!("ignore {h:x}\n"));
+        let dir = self.path.parent().unwrap();
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        let r = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&self.path)
+            .and_then(|mut f| f.write_all(s.as_bytes()));
+        if let Err(e) = r {
+            eprintln!("layoutfix: cannot save memory: {e}");
+        }
+    }
+
+    fn hash(&self, kind: &str, s: &str) -> u64 {
+        // FNV-1a: stable across runs, unlike std's RandomState
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in self.salt.to_le_bytes().iter().chain(kind.as_bytes()).chain(s.as_bytes()) {
+            h = (h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    fn word(&self, w: &str) -> u64 {
+        self.hash("w", &w.to_lowercase())
+    }
+
+    fn keys(&self, keys: &[Key]) -> u64 {
+        self.hash("k", &keys.iter().map(|k| k.0.to_string()).collect::<Vec<_>>().join(","))
+    }
 }
 
 struct Undo {
     at: Instant,
     keys: Vec<Key>,
     original: String, // text to put back (may include a one-letter word before)
-    word: String,     // the word itself: left alone for a while after a revert
+    word: String,     // the word itself: never fixed again after a revert
+    word_keys: u64,   // its keys hash: forgotten if it was learned
     from: usize,
+}
+
+/// A non-word left as typed: if the user erases it and types the same keys in the other script, learn that.
+struct Retype {
+    keys: Vec<Key>,
+    layout: usize,
+    erased: usize,
+    at: Instant,
 }
 
 /// A fix waiting for the word's keys to be released: a key retyped while it is still physically held
@@ -188,7 +303,8 @@ struct State {
     prev: Option<(Vec<Key>, usize)>, // one-letter word right before the current one, with its layout
     last_cyrillic: Option<usize>,
     undo: Option<Undo>,
-    ignored: HashMap<String, Instant>, // words the user just reverted: left alone for a while
+    memory: Memory,
+    retype: Option<Retype>,
     tap: Id,
     pid: i64, // app that received the previous key
     last_key: Instant,
@@ -244,6 +360,31 @@ fn load_layouts() -> (Vec<Layout>, Vec<Id>) {
         }
     }
     (layouts, sources)
+}
+
+/// Learned → dictionary → doubled capital → typo, in that order.
+fn find_fix(st: &mut State, keys: &[Key], cur: usize) -> Option<(usize, String)> {
+    let learned = st.memory.learned.get(&st.memory.keys(keys))
+        .and_then(|id| st.layouts.iter().position(|l| &l.id == id))
+        .filter(|&to| st.layouts[to].cyrillic != st.layouts[cur].cyrillic);
+    if let Some(to) = learned {
+        return decide::translate(keys, &st.layouts[to]).map(|t| (to, t));
+    }
+    let (layouts, last, sp) = (&st.layouts, st.last_cyrillic, &mut st.speller);
+    if let Some(f) = decide(keys, layouts, cur, last, &mut |w, l| sp.valid(w, l)) {
+        return Some(f);
+    }
+    if let Some(k2) = decide::fix_case(keys) {
+        if let Some(f) = decide(&k2, layouts, cur, last, &mut |w, l| sp.valid(w, l)) {
+            return Some(f);
+        }
+        // same layout: Cyrillic only, Latin has too many CamelCase names (OAuth, IPhone)
+        let c = &layouts[cur];
+        if let Some(t) = decide::translate(&k2, c).filter(|t| c.cyrillic && decide::word_ok(t, true) && sp.valid(t, &c.lang)) {
+            return Some((cur, t));
+        }
+    }
+    decide::typo(keys, layouts, cur, last, &mut |w, l, far| sp.typo_check(w, l, far))
 }
 
 fn current_layout(st: &State) -> Option<usize> {
@@ -348,7 +489,8 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
     flush(st, proxy);
     let undo = st.undo.take();
     if ty != KEY_DOWN {
-        reset(st, false); // mouse click: usually a new place to type; we only ever erase what we saw typed
+        reset(st, false);
+        st.retype = None; // mouse click: usually a new place to type; we only ever erase what we saw typed
         if st.debug {
             eprintln!("mouse");
         }
@@ -371,6 +513,11 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
     }
     st.pid = pid;
     st.last_key = Instant::now();
+    if key == K_BACKSPACE && st.keys.is_empty() {
+        if let Some(r) = &mut st.retype {
+            r.erased += if flags & CMD_CTRL_ALT != 0 { 1000 } else { 1 }; // ⌥⌫ / ⌘⌫ erase a whole word or more
+        }
+    }
     if flags & CMD_CTRL_ALT != 0 {
         reset(st, false); // shortcuts, ⌘Tab: next word starts fresh
         return e;
@@ -387,7 +534,10 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
             if st.debug {
                 eprintln!("  undo erase={}", u.keys.len() + 1);
             }
-            st.ignored.insert(u.word.to_lowercase(), Instant::now());
+            let w = st.memory.word(&u.word);
+            st.memory.ignored.insert(w);
+            st.memory.learned.remove(&u.word_keys);
+            st.memory.save();
             replace(st, proxy, u.keys.len() + 1, &u.keys, &u.original, u.from);
             post_key(proxy, K_SPACE, ' ', false);
             reset(st, false);
@@ -407,16 +557,31 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
             st.last_cyrillic = Some(cur);
         }
         let prev = st.prev.take();
+        if let Some(r) = st.retype.take() {
+            let same = r.keys.len() == keys.len() && r.keys.iter().zip(&keys).all(|(a, b)| a.0 == b.0);
+            if same && r.erased >= r.keys.len() && r.at.elapsed() < Duration::from_secs(30)
+                && st.layouts[r.layout].cyrillic != st.layouts[cur].cyrillic
+            {
+                let h = st.memory.keys(&keys);
+                st.memory.learned.insert(h, st.layouts[cur].id.clone());
+                let old = decide::translate(&keys, &st.layouts[r.layout]).unwrap_or_default();
+                let w = st.memory.word(&old);
+                st.memory.ignored.remove(&w);
+                st.memory.save();
+                if st.debug {
+                    eprintln!("  learned len={}", keys.len());
+                }
+            }
+        }
         if dirty || keys.is_empty() {
             return e;
         }
         let typed = decide::translate(&keys, &st.layouts[cur]).unwrap_or_default();
-        st.ignored.retain(|_, t| t.elapsed() < Duration::from_secs(600));
-        if st.ignored.contains_key(&typed.to_lowercase()) {
+        if st.memory.ignored.contains(&st.memory.word(&typed)) {
             return e;
         }
-        let (layouts, last, speller) = (&st.layouts, st.last_cyrillic, &mut st.speller);
-        if let Some((to, text)) = decide(&keys, layouts, cur, last, &mut |w, l| speller.valid(w, l)) {
+        let word_keys = st.memory.keys(&keys);
+        if let Some((to, text)) = find_fix(st, &keys, cur) {
             // A one-letter word just before ("z levf." = "я думаю") is fixed along, unless it already is a word ("a", "I").
             let one = prev.filter(|(_, l)| *l == cur).and_then(|(pk, _)| {
                 let orig = decide::translate(&pk, &st.layouts[cur])?;
@@ -434,7 +599,7 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
             if st.layouts[to].cyrillic {
                 st.last_cyrillic = Some(to);
             }
-            let undo = (key == K_SPACE).then(|| Undo { at: Instant::now(), keys: keys.clone(), original, word: typed, from: cur });
+            let undo = (key == K_SPACE).then(|| Undo { at: Instant::now(), keys: keys.clone(), original, word: typed, word_keys, from: cur });
             if keys.iter().any(|k| held(k.0)) {
                 st.pending = Some(Pending {
                     erase: keys.len(), keys, text, to,
@@ -452,6 +617,10 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
         }
         if st.debug {
             eprintln!("  nofix len={} cur={}", keys.len(), st.layouts[cur].lang);
+        }
+        let c = &st.layouts[cur];
+        if keys.len() >= 2 && !(decide::word_ok(&typed, c.cyrillic) && st.speller.valid(&typed, &c.lang)) {
+            st.retype = Some(Retype { keys: keys.clone(), layout: cur, erased: 0, at: Instant::now() });
         }
         if keys.len() == 1 && key == K_SPACE {
             st.prev = Some((keys, cur));
@@ -494,7 +663,8 @@ fn main() {
         for (i, l) in layouts.iter().enumerate() {
             let t = decide::translate(&keys, l).unwrap_or_default();
             let d = decide(&keys, &layouts, i, last_cyrillic, &mut |w, lang| sp.valid(w, lang));
-            println!("{} lang={} → {} valid={} | typed here, fix to: {:?}", l.id, l.lang, t, sp.valid(&t, &l.lang), d);
+            let ty = decide::typo(&keys, &layouts, i, last_cyrillic, &mut |w, lang, far| sp.typo_check(w, lang, far));
+            println!("{} lang={} → {} valid={} | typed here, fix to: {:?} typo: {:?}", l.id, l.lang, t, sp.valid(&t, &l.lang), d, ty);
         }
         return;
     }
@@ -507,7 +677,8 @@ fn main() {
         prev: None,
         last_cyrillic,
         undo: None,
-        ignored: HashMap::new(),
+        memory: Memory::load(),
+        retype: None,
         tap: null(),
         pid: 0,
         last_key: Instant::now(),

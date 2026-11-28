@@ -111,7 +111,13 @@ pub fn decide(
             if let Some(t) = translate(core, l) {
                 // keys that are letters here but punctuation in the target ("руддщб" → "hello,")
                 let w = if strict { t.as_str() } else { t.trim_matches(|ch: char| !ch.is_alphabetic()) };
-                if w.chars().count() >= MIN_LEN && word_ok(w, l.cyrillic) && valid(w, &l.lang) {
+                // a 2-letter core with punctuation ("ns," → "ты,") only into the common short words
+                let ok = match w.chars().count() {
+                    n if n >= MIN_LEN => word_ok(w, l.cyrillic) && valid(w, &l.lang),
+                    2 => !strict && short_word(w, &l.lang),
+                    _ => false,
+                };
+                if ok {
                     found.push((i, format!("{prefix}{t}{suffix}")));
                 }
             }
@@ -121,7 +127,7 @@ pub fn decide(
     // First every key as a letter of the target: "levf." is "думаю" (the . key is ю), not "дума" + ".".
     // Then punctuation kept as typed: "ghbdtn," → "привет,", "\"цщгдв\"" → "\"would\"", "руддщб" → "hello,".
     let mut found = find(keys, "", "", true);
-    if found.is_empty() && core.len() >= MIN_LEN {
+    if found.is_empty() && core.len() >= 2 {
         found = find(core, &prefix, &suffix, false);
     }
     if let Some(p) = last_cyrillic {
@@ -321,6 +327,17 @@ mod tests {
                 assert_eq!(t.chars().count(), KP.len());
             }
         }
+    }
+
+    #[test]
+    fn short_word_with_punct() {
+        let ls = vec![layout("en", false, "ns,."), layout("ru", true, "тыбю")];
+        let k = |v: &[u16]| v.iter().map(|&k| (k, false)).collect::<Vec<Key>>();
+        let mut none = dict(&[]);
+        assert_eq!(decide(&k(&[0, 1, 2]), &ls, 0, None, &mut none), Some((1, "ты,".into())));
+        assert_eq!(decide(&k(&[0, 1, 3]), &ls, 0, None, &mut none), Some((1, "ты.".into())));
+        let ls2 = vec![layout("en", false, "db,"), layout("ru", true, "вib")];
+        assert_eq!(decide(&k(&[0, 1, 2]), &ls2, 0, None, &mut none), None); // db, is kept
     }
 
     #[test]

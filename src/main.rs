@@ -310,6 +310,7 @@ struct State {
     last_key: Instant,
     debug: bool, // ~/Library/Logs/layoutfix.debug exists: log event classes, counts and timings (never characters)
     pending: Option<Pending>,
+    word_layout: Option<usize>, // layout the current word was started in
 }
 
 fn load_layouts() -> (Vec<Layout>, Vec<Id>) {
@@ -519,7 +520,9 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
         }
     }
     if flags & CMD_CTRL_ALT != 0 {
-        reset(st, false); // shortcuts, ⌘Tab: next word starts fresh
+        // shortcuts, ⌘Tab: next word starts fresh; mid-word (⌃Space layout switch, ⌘V) the rest is not a whole word
+        let mid = !st.keys.is_empty();
+        reset(st, mid);
         return e;
     }
     if unsafe { CGEventGetIntegerValueField(e, F_AUTOREPEAT) } != 0 {
@@ -637,6 +640,13 @@ extern "C" fn on_event(proxy: Id, ty: u32, e: Ev, user: *mut c_void) -> Ev {
         && st.layouts.iter().all(|l| l.table[key as usize * 2].is_some_and(char::is_alphabetic));
     let shift = flags & SHIFT != 0 || caps;
     if prints && st.keys.len() < 64 {
+        // layout switched by hand mid-word (Globe, Caps Lock): the user is fixing it, leave the word alone
+        let now = current_layout(st);
+        if st.keys.is_empty() {
+            st.word_layout = now;
+        } else if now != st.word_layout {
+            st.dirty = true;
+        }
         st.keys.push((key, shift));
     } else {
         // Tab/Esc start a fresh word
@@ -684,6 +694,7 @@ fn main() {
         last_key: Instant::now(),
         debug: std::env::var("HOME").is_ok_and(|h| std::path::Path::new(&h).join("Library/Logs/layoutfix.debug").exists()),
         pending: None,
+        word_layout: None,
     }));
     unsafe {
         CGRequestListenEventAccess();
